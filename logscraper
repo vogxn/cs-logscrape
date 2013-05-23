@@ -578,7 +578,7 @@ class CloudStackLogScraper:
             "\t-h --help\t\t\t\tthis help\n" \
             "\t-f --full\t\t\t\tFull mode, collects everything\n" \
             "\t-m --minimal\t\t\t\tCollects only system properties and the"\
-                " latest CloudPlatform log files\n" \
+                " latest CloudStack log files\n" \
             "\t-d --nodb\t\t\t\tDo not include cloud database dump\n" \
             "\t-s --nosystemvm\t\t\tSkip service VMs information "\
                 "[default, not implemented yet]\n" \
