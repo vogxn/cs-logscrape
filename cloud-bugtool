@@ -1,8 +1,33 @@
 #!/usr/bin/python
 
-from os.path import isdir
+from sys import path as syspath
+
+from os import path
+from os.path import isdir, isfile
+from sys import exit
+from os import uname
+from os import geteuid
+from io import open
+from shlex import split
+from subprocess import Popen
+from io import BytesIO
+from ConfigParser import ConfigParser
+
+
+from sys import argv
+from getopt import getopt, GetoptError
+from os.path import exists
+from tempfile import mkdtemp
+from time import localtime, strftime
+
+from getpass import getuser
+
+from xml.dom.minidom import Document
+
+from errno import EEXIST
 
 VERSION = "0.4"
+
 
 class CloudStackVersion:
     """ we need a way to know version of CloudStack we are on now 
@@ -37,20 +62,50 @@ class CloudStackVersion:
         if self.CS_VERSION == 4:
             return "/var/log/cloudstack"
 
+    def getVersion(self):
+        """
+            is there any CS installation here?
+            CS 3.0.x:
+                /etc/cloud
+                /var/log/cloud
+            CS 4.1.x:
+                /etc/cloudstack
+                /var/log/cloudstack
+        """
+        print ("Checking CloudStack installation")
+        cs3_installed = True
+        cs4_installed = True
 
-class CLOUD_BUGTOOL_MODE:
-    from sys import exit
-    """ all our subsystems have one variable to enable/disable it
-        sbs_system
-        sbs_db
-        sbs_logs
-        sbs_servicevms
+        cs3_dirs = ["/etc/cloud", "/var/log/cloud", "/usr/share/java"]
+        cs4_dirs = ["/etc/cloudstack", "/var/log/cloudstack", "/usr/share/java"]
+
+        for d in cs3_dirs:
+            cs3_installed &= isdir(d)
+
+        for d in cs4_dirs:
+            cs4_installed &= isdir(d)
+
+        if cs3_installed:
+            self.setVersion3()
+        if cs4_installed:
+            self.setVersion4()
+
+        return (cs3_installed | cs4_installed | cs_version.CS_VERSION)
+
+
+class Mode:
+    """ Mode defines the level of logging to be collected
+        all our subsystems have one variable to enable/disable it
+            sbs_system
+            sbs_db
+            sbs_logs
+            sbs_servicevms
     """
     def __init__(self):
         self.SYSTEM = 1
         self.DB = 2
-        self.LOGS_CP_LATEST = 4
-        self.LOGS_CP_ALL = 8
+        self.LOGS_CS_LATEST = 4
+        self.LOGS_CS_ALL = 8
         self.LOGS_SYSTEM_LATEST = 16
         self.LOGS_SYSTEM_ALL = 32
         self.SERVICEVM = 64
@@ -60,17 +115,17 @@ class CLOUD_BUGTOOL_MODE:
         self.MODE = 0
 
     def setMinimalMode(self):
-        self.MINIMAL |= self.SYSTEM + self.DB + self.LOGS_CP_LATEST
+        self.MINIMAL |= self.SYSTEM + self.DB + self.LOGS_CS_LATEST
         self.MODE = self.MINIMAL
 
     def setNormalMode(self):
         """ default mode """
-        self.NORMAL |= self.SYSTEM + self.DB + self.LOGS_CP_LATEST \
+        self.NORMAL |= self.SYSTEM + self.DB + self.LOGS_CS_LATEST \
             + self.LOGS_SYSTEM_LATEST
         self.MODE = self.NORMAL
 
     def setFullMode(self):
-        self.FULL |= self.SYSTEM + self.DB + self.LOGS_CP_ALL \
+        self.FULL |= self.SYSTEM + self.DB + self.LOGS_CS_ALL \
             + self.LOGS_SYSTEM_ALL + self.SERVICEVM
         self.MODE = self.FULL
 
@@ -81,28 +136,263 @@ class CLOUD_BUGTOOL_MODE:
         """ This is default now, it's not implemented yet """
         self.MODE &= ~self.SERVICEVM
 
-    def defGetMode(self):
+    def getMode(self):
         if self.MODE:
             return self.MODE
         else:
             print "Internal error, MODE not defined"
             exit(2)
 
+
+class SubSystem:
+    """ A subsystem is a layer of the OS platform we are looking at for information
+        eg: Application (app logs, db logs etc)
+            Network (netstat, network information)
+            System  (systemcmds, disk io, work load)
+    """
+    def __init__(self):
+        self.tmpdir = "/tmp"
+        self.cmds = [
+            "hostname",
+            "hostname -s",
+            "hostname --fqdn",
+            "df -h",
+            "ps axf",
+            "top -b -n 1",
+            "free -k",
+            "netstat -nlp",
+            "date",
+            "dmesg",
+            "uname -a",
+            "ifconfig -a",
+            "route -n",
+            "ip addr sh",
+            "uptime",
+            "whoami",
+            "mount -l",
+            "rpm -qa"
+        ]
+        self.files = [
+            "/etc/cloudstack-release",
+            "/etc/hosts",
+            "/etc/resolv.conf",
+            "/etc/sysctl.conf"
+        ]
+
+    def print_sbs_name(self, p_name):
+        if p_name:
+            print "Collecting data from %s subsystem" % p_name
+        else:
+            print "UNKNOWN subsystem (!?)"
+
+    def sbs_system_cmd_exec(self, p_cmd, p_path):
+        """ exec commands """
+        out_file = path.join(p_path, p_cmd.replace(" ", ""))
+        if isdir(p_path):
+            cmd_args = split(p_cmd)
+            try:
+                file = open(out_file, 'w')
+                p = Popen(cmd_args, -1, None, None, file)
+                p.wait()
+                file.close()
+            except OSError as e:
+                print "Skip command: " + str(cmd_args) + ", " + str(e)
+        else:
+            raise IOError("%s is not a valid directory" % p_path)
+
+    def sbs_system(self, p_tmp_dir):
+        """
+            sbs_system()    system subsystem
+                    collect system properties
+        """
+        sbs_name = "system"
+        self.print_sbs_name(sbs_name)
+        sbs_path = path.join(p_tmp_dir, sbs_name)
+        mkdir(sbs_path)
+
+        for cmd in self.cmds:
+            self.sbs_system_cmd_exec(cmd, sbs_path)
+
+        """ copy /etc """
+        sbs_path_etc = path.join(sbs_path, "/etc")
+        mkdir(sbs_path_etc)
+        cp_ar("/etc/sysconfig", sbs_path_etc)
+        cp_ar(cs_version.getConfigDir(), sbs_path_etc)
+
+    def sbs_db(self, p_tmp_dir):
+        """
+            sbs_db()    database subsystem
+                    takes database dump and logs if any
+
+                    mysqldump -u root -p  cloud
+                    mysqldump -u root -p  cloud_usage
+                    scripts/storage/secondary/cloud-install-sys-tmplt
+        """
+        sbs_name = "database"
+        mysqldump_found = False
+        for _path in syspath:
+            if isfile(path.join(_path, "mysqldump")):
+                mysqldump_found = True
+                break
+        if not mysqldump_found:
+            mysqldump_missing = "Unable to find mysqldump utility, \
+                skipping database dump"
+            info(mysqldump_missing, False)
+            return False
+
+        self.print_sbs_name(sbs_name)
+        sbs_path = path.join(p_tmp_dir, sbs_name)
+        mkdir(sbs_path)
+        db_dict = self.get_db_properties()
+        """ as of now we can only decrypt db pass for file type encType """
+        if db_dict["db_enc_type"] != "file":
+            raise RuntimeError("Encryption type %s unsupported" % db_dict["db_enc_type"])
+        decrypt_db_pass(db_dict)
+
+        db_dump_path_cloud = path.join(sbs_path, "/cloud.sql")
+        db_dump_path_cloud_usage = path.join(sbs_path, "/cloud_usage.sql")
+
+        """ we do not assume root user owns the cloud databases, we get the
+            username from /etc/cloud/management/db.properties
+        """
+        mysqldump_cloud = "mysqldump -u " + db_dict['db_cloud_username'] + \
+            " -h localhost -p" + db_dict['db_clear_text_pass'] + " cloud"
+        mysqldump_cloud_usage = "mysqldump -u " + db_dict['db_cloud_username'] + \
+            " -h localhost -p" + db_dict['db_clear_text_pass'] + " cloud_usage"
+
+        """ exec dump commands """
+        if isdir(sbs_path):
+            cmd_args_cloud = split(mysqldump_cloud)
+            cmd_args_cloud_usage = split(mysqldump_cloud_usage)
+            try:
+                file_cloud = open(db_dump_path_cloud, 'w')
+                p = Popen(cmd_args_cloud, -1, None, None, file_cloud)
+                p.wait()
+                file_cloud.close()
+
+                file_cloud_usage = open(db_dump_path_cloud_usage, 'w')
+                p = Popen(cmd_args_cloud_usage, -1, None, None, file_cloud_usage)
+                p.wait()
+                file_cloud_usage.close()
+            except OSError as e:
+                raise e
+        else:
+            raise IOError("%s is not a valid directory" % sbs_path)
+
+    def get_db_properties(self):
+        """ reading /etc/cloud/management/db.properties, I am using special
+            hack to read the config file our config file does not have any
+            sections and ConfigParser expect to have at least one
+        """
+        db_dict = {}
+        db_prop_file = cs_version.getConfigDir() + "/management/db.properties"
+        db_dict["db_prop_file"] = db_prop_file
+
+        if isfile(db_prop_file):
+            config_file = open(db_prop_file)
+            """ reading file to add one fake section, ConfigParser
+                REQUIRES has one top section so we are good and creating
+                this fake top section
+            """
+            config_file_content = config_file.read()
+            config_file.close()
+            """ adding fake section """
+            config_file_content_with_section = "[default_section]\n"\
+                                              + config_file_content
+            config_file_content_io = BytesIO(config_file_content_with_section)
+            config = ConfigParser()
+            config.readfp(config_file_content_io)
+
+            db_dict["db_cloud_host"] =\
+            config.get("default_section", "db.cloud.host")
+            db_dict["db_cloud_username"] =\
+            config.get("default_section", "db.cloud.username")
+            db_dict["db_cloud_password"] =\
+            config.get("default_section", "db.cloud.password")
+            db_dict["db_enc_type"] =\
+            config.get("default_section", "db.cloud.encryption.type")
+        else:
+            raise IOError("Unable to find config file %s" % db_prop_file)
+
+        """ how DB pass is encrypted if at all """
+        key_file = cs_version.getConfigDir() + "/management/key"
+        if isfile(key_file):
+            key_file_fd = open(key_file)
+            """ we expect just one line """
+            line = key_file_fd.readline()
+            key_file_fd.close()
+            db_dict["db_msKey"] = line
+        else:
+            raise IOError("Cannot find database key file")
+        return db_dict
+
+    def sbs_logs(self, p_tmp_dir):
+        """
+            sbs_logs() system subsystem
+                    collect system properties
+        """
+        sbs_name = "logs"
+        self.print_sbs_name(sbs_name)
+        sbs_path = path.join(p_tmp_dir, "/system/var")
+        mkdir(sbs_path)
+
+        if mode.getMode() & \
+                mode.LOGS_CS_LATEST & \
+                ~(mode.LOGS_CS_ALL |
+                    mode.LOGS_SYSTEM_ALL):
+            files = [
+                "api-server.log",
+                "apilog.log",
+                "awsapi.log",
+                "catalina.out",
+                "management-server.log",
+                "setupManagement.log"
+            ]
+            logs_dir = path.join(cs_version.getLogDir(), "management")
+            sbs_path = path.join(p_tmp_dir, "system", cs_version.getLogDir(), "management")
+            for file in files:
+                full_path = path.join(logs_dir, file)
+                if exists(full_path):
+                    cp_ar(full_path, sbs_path)
+                else:
+                    print "WARNING: file " + full_path + " does not exist"
+        if mode.getMode() & mode.LOGS_CS_ALL &\
+            (mode.LOGS_SYSTEM_ALL>0):
+            full_path = path.join(cs_version.getLogDir(), "management")
+            sbs_path = path.join(p_tmp_dir, "system", cs_version.getLogDir(), "management")
+            cp_ar(full_path, sbs_path)
+        if mode.getMode() & \
+                mode.LOGS_SYSTEM_LATEST & \
+                ~mode.LOGS_SYSTEM_ALL:
+            files = [
+                "anaconda.log",
+                "boot.log",
+                "cron",
+                "dmesg",
+                "messages",
+                "mysqld.log"
+            ]
+            logs_dir = "/var/log/"
+            sbs_path = path.join(p_tmp_dir, "/system/var/log/")
+            for file in files:
+                full_path = path.join(logs_dir, file)
+                cp_ar(full_path, sbs_path)
+        if mode.getMode() & mode.LOGS_SYSTEM_ALL:
+            full_path = "/var/log"
+            sbs_path = path.join(p_tmp_dir, "/system/var/")
+            cp_ar(full_path, sbs_path)
+
+
 # global variables
 cs_version = CloudStackVersion()
-cloud_bugtool_mode = CLOUD_BUGTOOL_MODE()
+mode = Mode()
+
 
 
 def addManifestFile(p_argv, p_tmp_dir):
-    from xml.dom.minidom import getDOMImplementation
-    from xml.dom.minidom import Document
-    from time import localtime, strftime
-    from getpass import getuser
-    from os import uname
-
-    localtime = localtime()
+    ltime = localtime(seconds=None)
     my_hostname = uname()[1]
-    str_date = strftime("%Y.%m.%d-%H.%M.%S", localtime)
+    str_date = strftime("%Y.%m.%d-%H.%M.%S", ltime)
     argvs = ""
     for arg in p_argv:
         argvs += arg + " "
@@ -146,7 +436,6 @@ def addManifestFile(p_argv, p_tmp_dir):
     manifestFile.write(xml)
     manifestFile.close()
 
-
 def info(msg, result=None):
     from sys import stdout
     output = ""
@@ -161,21 +450,12 @@ def info(msg, result=None):
     stdout.write(output)
     stdout.flush()
 
-
 def info2(msg):
     from sys import stdout
     output = ""
     output += "\033[91m%-2s\033[0m" % msg
     stdout.write(output)
     stdout.flush()
-
-
-def print_sbs_name(p_name):
-    if p_name:
-        print "Collecting data from %s subsystem" % p_name
-    else:
-        print "UNKNOWN subsystem (!?)"
-
 
 def mkdir(p_path):
     """ create directory, helper """
@@ -184,11 +464,10 @@ def mkdir(p_path):
         try:
             makedirs(p_path)
         except OSError as e:
-            if e.errno == errno.EEXIST:
+            if e.errno == EEXIST: #file exists
                 pass
             else:
                 raise
-
 
 def rm_rf(p_path):
     from shutil import rmtree
@@ -196,7 +475,6 @@ def rm_rf(p_path):
 
     if isdir(p_path):
         rmtree(p_path)
-
 
 def cp_ar(p_src_path, p_dst_path):
     """ use this to copy directories recursivly but also accept files """
@@ -218,7 +496,6 @@ def cp_ar(p_src_path, p_dst_path):
         print "FAIL (one of args is not a valid directory): cp -LR %s %s" \
             % (p_src_path, p_dst_path)
         return False
-
 
 def compress_all_logs(p_path):
     """ TODO: check what are the compression tools available,
@@ -275,84 +552,6 @@ def compress_all_logs(p_path):
         return False
 
 
-def sbs_system_cmd_exec(p_cmd, p_path):
-    from io import open
-    from shlex import split
-    from os.path import isdir
-    from subprocess import Popen
-
-    out_file = p_path + "/" + p_cmd.replace(" ", "")
-    #print "%s, %s, %s" % (p_cmd,p_path,out_file)
-
-    """ exec commands """
-    if isdir(p_path):
-        cmd_args = split(p_cmd)
-        try:
-            file = open(out_file, 'w')
-            p = Popen(cmd_args, -1, None, None, file)
-            p.wait()
-            file.close()
-        except OSError as e:
-            print "Skip command: " + str(cmd_args) + ", " + str(e)
-    else:
-        print "FAIL (this is not a valid directory): %s" % p_path
-        return False
-
-
-def get_db_properties():
-    from io import BytesIO
-    from os.path import isfile
-    from ConfigParser import ConfigParser
-    """ reading /etc/cloud/management/db.properties, I am using special
-        hack to read the config file our config file does not have any
-        sections and ConfigParser expect to have at least one
-    """
-
-    db_dict = {}
-    db_prop_file = cs_version.getConfigDir() + "/management/db.properties"
-    db_dict["db_prop_file"] = db_prop_file
-
-    if isfile(db_prop_file):
-        config_file = open(db_prop_file)
-        """ reading file to add one fake section, ConfigParser
-            REQUIERS has one top section so we are good and creating
-            this fake top section
-        """
-        config_file_content = config_file.read()
-        config_file.close()
-        """ adding fake section """
-        config_file_content_wit_section = "[default_section]\n" \
-            + config_file_content
-        confif_file_content_io = BytesIO(config_file_content_wit_section)
-
-        config = ConfigParser()
-        config.readfp(confif_file_content_io)
-
-        db_dict["db_cloud_host"] = \
-            config.get("default_section", "db.cloud.host")
-        db_dict["db_cloud_username"] = \
-            config.get("default_section", "db.cloud.username")
-        db_dict["db_cloud_password"] = \
-            config.get("default_section", "db.cloud.password")
-        db_dict["db_enc_type"] = \
-            config.get("default_section", "db.cloud.encryption.type")
-
-    else:
-        print "Unable to find config file %s" % db_prop_file
-
-    """ how DB pass is encrypted if at all """
-    key_file = cs_version.getConfigDir() + "/management/key"
-    if isfile(key_file):
-        key_file_fd = open(key_file)
-        """ we expect just one line """
-        line = key_file_fd.readline()
-        key_file_fd.close()
-        db_dict["db_msKey"] = line
-    else:
-        print "Cannot find database key file"
-        return None
-    return db_dict
-
 
 def decrypt_db_pass(p_db_dict):
     from shlex import split
@@ -368,212 +567,24 @@ def decrypt_db_pass(p_db_dict):
 
     db_pass_cmd = "java -classpath \
 	/usr/share/java/cloud-jasypt-1.8.jar:/usr/share/java/jasypt-1.9.0.jar \
-         org.jasypt.intf.cli.JasyptPBEStringDecryptionCLI decrypt.sh input=" \
-        + encPassword \
-        + " password=" \
-        + msKey \
-        + " verbose=false"
+         org.jasypt.intf.cli.JasyptPBEStringDecryptionCLI decrypt.sh input="\
+                  + encPassword\
+                  + " password="\
+                  + msKey\
+                  + " verbose=false"
 
     db_pwdec_exec = Popen(split(db_pass_cmd), stdout=PIPE)
     p_db_dict["db_clear_text_pass"] = db_pwdec_exec.stdout.read().rstrip()
     return p_db_dict
 
 
-def sbs_system(p_tmp_dir):
-    """
-        sbs_system()    system subsystem
-                collect system properties
-    """
-    sbs_name = "system"
-    cmds = ["df -h", "ps axf", "top -b -n 1", "free -k", "netstat -nlp",
-            "date", "dmesg", "uname -a", "whoami", "hostname",
-            "ifconfig -a", "route -n", "ip addr sh", "uptime", "hostname -s",
-            "mount -l", "hostname --fqdn", "cloud-sccs", "rpm -qa"]
-    files = ["/etc/cloudstack-release", "/etc/hosts",
-        "/etc/resolv.conf", "/etc/sysctl.conf"]
 
-    print_sbs_name(sbs_name)
-    sbs_path = p_tmp_dir + "/" + sbs_name
-    mkdir(sbs_path)
-
-    for cmd in cmds:
-        sbs_system_cmd_exec(cmd, sbs_path)
-
-    """ copy /etc """
-    sbs_path_etc = sbs_path + "/etc"
-    mkdir(sbs_path_etc)
-    cp_ar("/etc/sysconfig", sbs_path_etc)
-    cp_ar(cs_version.getConfigDir(), sbs_path_etc)
-
-
-def sbs_db(p_tmp_dir):
-    """
-        sbs_db()    database subsystem
-                takes database dump and logs if any
-
-                mysqldump -u root -p  cloud
-                mysqldump -u root -p  cloud_usage
-                scripts/storage/secondary/cloud-install-sys-tmplt
-    """
-    from shlex import split
-    from os.path import isdir
-    from os.path import isfile
-    from subprocess import Popen
-
-    if not (isfile("/bin/mysqldump") or isfile("/usr/bin/mysqldump") or
-        isfile("/usr/local/bin/mysqldump")):
-        mysqldump_missing = "Unable to find mysqldump utility, \
-            skipping database dump"
-        info(mysqldump_missing, False)
-        return False
-
-    sbs_name = "database"
-    print_sbs_name(sbs_name)
-    sbs_path = p_tmp_dir + "/" + sbs_name
-    mkdir(sbs_path)
-    db_dict = get_db_properties()
-    """ as of now we can only decrypt db pass for file type encType """
-    if db_dict["db_enc_type"] != "file":
-        return None
-    decrypt_db_pass(db_dict)
-
-    db_dump_path_cloud = sbs_path + "/cloud.sql"
-    db_dump_path_cloud_usage = sbs_path + "/cloud_usage.sql"
-
-    """ we do not assume root user owns the cloud databases, we get the
-        username from /etc/cloud/management/db.properties
-    """
-    mysqldump_cloud = "mysqldump -u " + db_dict['db_cloud_username'] + \
-        " -h localhost -p" + db_dict['db_clear_text_pass'] + " cloud"
-    mysqldump_cloud_usage = "mysqldump -u " + db_dict['db_cloud_username'] + \
-        " -h localhost -p" + db_dict['db_clear_text_pass'] + " cloud_usage"
-
-    """ exec dump commands """
-    if isdir(sbs_path):
-        cmd_args_cloud = split(mysqldump_cloud)
-        cmd_args_cloud_usage = split(mysqldump_cloud_usage)
-        try:
-            file_cloud = open(db_dump_path_cloud, 'w')
-            p = Popen(cmd_args_cloud, -1, None, None, file_cloud)
-            p.wait()
-            file_cloud.close()
-
-            file_cloud_usage = open(db_dump_path_cloud_usage, 'w')
-            p = Popen(cmd_args_cloud_usage, -1, None, None, file_cloud_usage)
-            p.wait()
-            file_cloud_usage.close()
-        except OSError as e:
-            print e
-    else:
-        print "FAIL (this is not a valid directory): %s" % p_path
-        return False
-    #print db_dict
-
-
-def sbs_logs(p_tmp_dir):
-    """
-        sbs_logs() system subsystem
-                collect system properties
-    """
-    from os.path import exists
-
-    sbs_name = "logs"
-    print_sbs_name(sbs_name)
-    sbs_path = p_tmp_dir + "/system/var"
-    mkdir(sbs_path)
-
-    if cloud_bugtool_mode.defGetMode() & \
-            cloud_bugtool_mode.LOGS_CP_LATEST & \
-            ~(cloud_bugtool_mode.LOGS_CP_ALL |
-                cloud_bugtool_mode.LOGS_SYSTEM_ALL):
-        #print "cloud_bugtool_mode.LOGS_CP_LATEST"
-        files = ["api-server.log", "apilog.log", "awsapi.log",
-            "catalina.out", "management-server.log", "setupManagement.log"]
-        logs_dir = cs_version.getLogDir() + "/management/"
-        sbs_path = p_tmp_dir + "/system/"+cs_version.getLogDir()+"/management/"
-        for file in files:
-            full_path = logs_dir + file
-            if exists(full_path):
-                cp_ar(full_path, sbs_path)
-            else:
-                print "WARNING: file " + full_path + " does not exist"
-    if cloud_bugtool_mode.defGetMode() & cloud_bugtool_mode.LOGS_CP_ALL &\
-        (cloud_bugtool_mode.LOGS_SYSTEM_ALL>0):
-        full_path = cs_version.getLogDir() + "/management/"
-        sbs_path = p_tmp_dir + "/system/"+cs_version.getLogDir()+"/management/"
-        cp_ar(full_path, sbs_path)
-    if cloud_bugtool_mode.defGetMode() & \
-            cloud_bugtool_mode.LOGS_SYSTEM_LATEST & \
-            ~cloud_bugtool_mode.LOGS_SYSTEM_ALL:
-        #print "cloud_bugtool_mode.LOGS_SYSTEM_LATEST"
-        files = ["anaconda.log", "boot.log", "cron", "dmesg",
-            "messages", "mysqld.log"]
-        logs_dir = "/var/log/"
-        sbs_path = p_tmp_dir + "/system/var/log/"
-        for file in files:
-            full_path = logs_dir + file
-            cp_ar(full_path, sbs_path)
-    if cloud_bugtool_mode.defGetMode() & cloud_bugtool_mode.LOGS_SYSTEM_ALL:
-        #print "cloud_bugtool_mode.LOGS_SYSTEM_ALL"
-        full_path = "/var/log"
-        sbs_path = p_tmp_dir + "/system/var/"
-        cp_ar(full_path, sbs_path)
-    #cp_ar(logs_path, sbs_path)
-
-
-def sbs_servicevms(p_tmp_dir):
-    """
-        sbs_servicevms()    system subsystem
-                    collect system properties
-    """
-    sbs_name = "service_vm"
-    print_sbs_name(sbs_name)
-    sbs_path = p_tmp_dir + "/" + sbs_name
-    mkdir(sbs_path)
-
-
-def check_if_cs_installed():
-    """
-        TODO: find a better way to check if CS is installed
-
-        is there any CS installation here?
-        CS 3.0.x:
-            /etc/cloud
-            /var/log/cloud
-        CS 4.1.x:
-            /etc/cloudstack
-            /var/log/cloudstack
-    """
-    from os import listdir
-    from re import search
-    from os.path import isfile
-
-    print ("Checking CloudStack instalation")
-
-    cs3_installed = True
-    cs4_installed = True
-
-    cs3_dirs = ["/etc/cloud", "/var/log/cloud", "/usr/share/java"]
-    cs4_dirs = ["/etc/cloudstack", "/var/log/cloudstack", "/usr/share/java"]
-
-    for d in cs3_dirs:
-        cs3_installed &= isdir(d)
-
-    for d in cs4_dirs:
-        cs4_installed &= isdir(d)
-
-    if cs3_installed:
-        cs_version.setVersion3()
-    if cs4_installed:
-        cs_version.setVersion4()
-
-    return (cs3_installed | cs4_installed | cs_version.CS_VERSION)
 
 
 def usage():
     from sys import argv
     print argv[0] + " version " + VERSION + ", utility collects information" \
-        " for CloudStack/CloudPlatform troubleshooting purposes" \
+        " for CloudStack troubleshooting purposes" \
         "\n\n" \
         "usage: " + argv[0] + " [arguments]" \
         "\n\n" \
@@ -587,10 +598,10 @@ def usage():
             "[default, not implemented yet]\n" \
         "\n" \
         "Modes:\n" \
-        " MINIMAL\tsystem info, latest CP log files\n" \
-        " NORMAL\t\tsystem info, cloud database, latest CP log files,"\
+        " MINIMAL\tsystem info, latest CS log files\n" \
+        " NORMAL\t\tsystem info, cloud database, latest CS log files,"\
             " latest system log files [default mode]\n" \
-        " FULL\t\tsystem info, cloud database, all CP log "\
+        " FULL\t\tsystem info, cloud database, all CS log "\
             "files, all system log files\n" \
         "\nWe have three modes defined but in case this is needed we can "\
             "switch off some particular things"\
@@ -608,18 +619,10 @@ def main(p_argv):
         sbs_*    implementations of subsystems collecting logs and other info
         we assume the /tmp directory is our default log location
     """
-    from os import removedirs
-    from os import uname
-    from os import geteuid
-    from sys import exc_info
-    from sys import exit, argv
-    from getopt import getopt, GetoptError
-    from os.path import exists
-    from os.path import split
-    from tempfile import mkdtemp
-    from time import localtime, strftime
+    cs = CloudStackVersion()
+    mode.setNormalMode()
+    subsystem = SubSystem()
 
-    cloud_bugtool_mode.setNormalMode()
     try:
         opts, args = getopt(argv[1:], "hmfds", ["help", "minimal",
             "full", "nodb", "nosystemvm"])
@@ -628,24 +631,23 @@ def main(p_argv):
                 usage()
                 exit()
             elif o in ("-m", "--minimal"):
-                cloud_bugtool_mode.setMinimalMode()
+                mode.setMinimalMode()
             elif o in ("-f", "--full"):
-                cloud_bugtool_mode.setFullMode()
+                mode.setFullMode()
             elif o in ("-d", "--nodb"):
-                cloud_bugtool_mode.setNoDB()
+                mode.setNoDB()
             elif o in ("-s", "--nosystemvm"):
-                cloud_bugtool_mode.setNoServiceVM()
+                mode.setNoServiceVM()
     except GetoptError as err:
         print str(err)
         usage()
         exit(2)
-    #print cloud_bugtool_mode.defGetMode()
 
-    """ we need to have access to logs and configs, checking is we are root """
+    """ we need to have access to logs and configs, checking if we are root """
     if geteuid() != 0:
         print "Sorry, you need to run this utility as root"
         exit(1)
-    if not check_if_cs_installed():
+    if not cs.getVersion():
         print("Cannot find a CloudStack installation on this system, exiting.")
         exit()
 
@@ -653,11 +655,11 @@ def main(p_argv):
         /tmp/cloud-bugtool_<DATE and TIME>.<RANDOM STRING>/<HOSTNAME>/
     """
     print "We are going to collect diagnostic information now, "\
-        "please review the content and remove\nall sensitive information "\
-        "before you sharing it with anybody."
-    localtime = localtime()
+        "please review the content and remove\n" \
+        "all sensitive information before you share it with anybody."
+    ltime = localtime()
     my_hostname = uname()[1]
-    str_date = strftime("%Y.%m.%d-%H.%M.%S", localtime)
+    str_date = strftime("%Y.%m.%d-%H.%M.%S", ltime)
     tmp_prefix = "cloudstack-bugtool_" + str_date + "."
     tmp_dir = mkdtemp(prefix=tmp_prefix)
     """ tmp_dir is what we need to cleanup later,
@@ -666,21 +668,16 @@ def main(p_argv):
     tmp_dir = tmp_dir + "/" + my_hostname
     mkdir(tmp_dir)
 
-    """ what MODE we are running? """
-    #print "Mode: "+str(cloud_bugtool_mode.defGetMode())
-
-    if cloud_bugtool_mode.defGetMode() & cloud_bugtool_mode.SYSTEM:
-        sbs_system(tmp_dir)
-    if cloud_bugtool_mode.defGetMode() & cloud_bugtool_mode.DB:
-        sbs_db(tmp_dir)
-    if cloud_bugtool_mode.defGetMode() & \
-        (cloud_bugtool_mode.LOGS_CP_LATEST |
-            cloud_bugtool_mode.LOGS_CP_ALL |
-            cloud_bugtool_mode.LOGS_SYSTEM_LATEST |
-            cloud_bugtool_mode.LOGS_SYSTEM_ALL):
-        sbs_logs(tmp_dir)
-    if cloud_bugtool_mode.defGetMode() & cloud_bugtool_mode.SERVICEVM:
-        sbs_servicevms(tmp_dir)
+    if mode.getMode() & mode.SYSTEM:
+        subsystem.sbs_system(tmp_dir)
+    if mode.getMode() & mode.DB:
+        subsystem.sbs_db(tmp_dir)
+    if mode.getMode() & \
+        (mode.LOGS_CS_LATEST |
+            mode.LOGS_CS_ALL |
+            mode.LOGS_SYSTEM_LATEST |
+            mode.LOGS_SYSTEM_ALL):
+        subsystem.sbs_logs(tmp_dir)
 
     addManifestFile(p_argv, tmp_dir)
     compress_all_logs(tmp_dir)
@@ -691,7 +688,6 @@ def main(p_argv):
         except OSError as e:
             print "Cannot remove temporary directory %s" % tmp_dir
             print e
-
 
 if __name__ == "__main__":
     from sys import argv
