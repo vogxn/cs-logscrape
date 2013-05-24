@@ -82,7 +82,6 @@ class CloudStackVersion:
                 /etc/cloudstack
                 /var/log/cloudstack
         """
-        print ("Checking CloudStack installation")
         cs3_installed = True
         cs4_installed = True
 
@@ -150,7 +149,6 @@ class Mode:
         if self.MODE:
             return self.MODE
         else:
-            print "Internal error, MODE not defined"
             exit(2)
 
 
@@ -520,7 +518,7 @@ class CloudStackLogScraper:
                 if exists(full_path):
                     self.shell.cp_ar(full_path, sbs_path)
                 else:
-                    print "WARNING: file " + full_path + " does not exist"
+                    self.logger.warn("file " + full_path + " does not exist")
         if mode.getMode() & mode.LOGS_CS_ALL &\
             (mode.LOGS_SYSTEM_ALL>0):
             full_path = cs_version.getLogDir() + "/management"
@@ -636,10 +634,6 @@ def main(argv):
     if not cs.getVersion():
         print("Cannot find a CloudStack installation on this system, exiting.")
         exit()
-
-    print "We are going to collect diagnostic information now, "\
-        "please review the content and remove\n" \
-        "all sensitive information before you share it with anybody."
 
     if mode.getMode() & mode.SYSTEM:
         sc.sbs_system()
