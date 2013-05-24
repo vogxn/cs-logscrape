@@ -28,8 +28,6 @@ from zipfile import ZipFile
 from zipfile import BadZipfile
 
 import logging
-
-
 VERSION = "0.4"
 
 def get_basic_logger(lvl=logging.DEBUG):
@@ -156,12 +154,6 @@ class Mode:
             exit(2)
 
 
-# global variables
-cs_version = CloudStackVersion()
-cs_version.getVersion()
-mode = Mode()
-
-
 class ShellUtils:
     def __init__(self, lvl=logging.DEBUG):
         self.logger = get_basic_logger(lvl)
@@ -247,7 +239,6 @@ class ShellUtils:
             chdir(cwd)
         else:
             raise IOError("%s is not a valid directory" % p_path)
-
 
 
 class CloudStackLogScraper:
@@ -595,6 +586,11 @@ class CloudStackLogScraper:
             "\n"
 
 
+# global variables
+cs_version = CloudStackVersion()
+cs_version.getVersion()
+mode = Mode()
+
 def main(argv):
     """
         main()    function calls subsystem sbs_* functions
@@ -653,8 +649,6 @@ def main(argv):
             mode.LOGS_SYSTEM_LATEST |
             mode.LOGS_SYSTEM_ALL):
         sc.sbs_logs(tmp_dir)
-
-
 
 if __name__ == "__main__":
     from sys import argv
