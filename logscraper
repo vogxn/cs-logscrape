@@ -40,7 +40,7 @@ def get_basic_logger(lvl=logging.DEBUG):
 
 
 class CloudStackVersion:
-    """ we need a way to know version of CloudStack we are on now 
+    """ we need a way to know version of CloudStack we are on now
         this is because some components change location between
         different versions
     """
@@ -171,7 +171,7 @@ class ShellUtils:
 
     def info2(self, msg):
         output = ""
-        output += "\033[91m%-2s\033[0m" % msg
+        output += "\033[91m%-2s\033[0m\n" % msg
         stdout.write(output)
         stdout.flush()
 
@@ -216,13 +216,12 @@ class ShellUtils:
                  % p_path)
             cwd = getcwd()
             chdir("/tmp")
-            path_split = split(p_path)
-            path_split2 = split(path_split[0])
-            zipfile_name = path_split2[1] + ".zip"
+            path_split = p_path.split('/')
+            zipfile_name = path_split[2] + ".zip"
 
             try:
                 zf = ZipFile(zipfile_name, "w")
-                for root, dirs, files in walk(path_split2[1]):
+                for root, dirs, files in walk(path_split[1]):
                     for filename in files:
                         if filename == "cloud.keystore" or \
                             filename == "cloudmanagementserver.keystore" or \
@@ -231,9 +230,9 @@ class ShellUtils:
                         file = join(root, filename)
                         zf.write(join(file))
                 zf.close()
-                info = "diagnostic information ready"
+                info = "diagnostic information ready\n"
                 stdout.write(info)
-                self.info2(path_split[0] + ".zip")
+                self.info2(zipfile_name)
             except BadZipfile as ze:
                 raise IOError("Unable to create zip archive because of %s" % ze)
             chdir(cwd)
@@ -326,13 +325,13 @@ class CloudStackLogScraper:
             System  (systemcmds, disk io, work load)
         """
         if p_name:
-            self.logger.debug("Collecting data from %s subsystem" % p_name)
+            self.logger.debug("Collecting data from %s subsystem and saving at %s " % (p_name, self.tmpdir))
         else:
             self.logger.warn("Unknown subsystem %s" % p_name)
 
-    def sbs_system_cmd_exec(self, p_cmd):
+    def sbs_system_cmd_exec(self, p_cmd, sbs_name):
         """ exec commands """
-        out_file = path.join(self.tmpdir, p_cmd.replace(" ", ""))
+        out_file = path.join(self.tmpdir, sbs_name, p_cmd.replace(" ", ""))
         if isdir(self.tmpdir):
             cmd_args = split(p_cmd)
             try:
@@ -356,10 +355,10 @@ class CloudStackLogScraper:
         self.shell.mkdir(sbs_path)
 
         for cmd in self.cmds:
-            self.sbs_system_cmd_exec(cmd, sbs_path)
+            self.sbs_system_cmd_exec(cmd, sbs_name)
 
         """ copy /etc """
-        sbs_path_etc = path.join(sbs_path, "/etc")
+        sbs_path_etc = path.join(sbs_path, "etc")
         self.shell.mkdir(sbs_path_etc)
         self.shell.cp_ar("/etc/sysconfig", sbs_path_etc)
         self.shell.cp_ar(cs_version.getConfigDir(), sbs_path_etc)
@@ -395,8 +394,8 @@ class CloudStackLogScraper:
             raise RuntimeError("Encryption type %s unsupported" % db_dict["db_enc_type"])
         self.decrypt_db_pass(db_dict)
 
-        db_dump_path_cloud = path.join(sbs_path, "/cloud.sql")
-        db_dump_path_cloud_usage = path.join(sbs_path, "/cloud_usage.sql")
+        db_dump_path_cloud = path.join(sbs_path, "cloud.sql")
+        db_dump_path_cloud_usage = path.join(sbs_path, "cloud_usage.sql")
 
         """ we do not assume root user owns the cloud databases, we get the
             username from /etc/cloud/management/db.properties
@@ -499,7 +498,7 @@ class CloudStackLogScraper:
         """
         sbs_name = "logs"
         self.log_subsystem(sbs_name)
-        sbs_path = path.join(self.tmpdir, "/system/var")
+        sbs_path = path.join(self.tmpdir, "system/var")
         self.shell.mkdir(sbs_path)
 
         if mode.getMode() & \
@@ -514,8 +513,8 @@ class CloudStackLogScraper:
                 "management-server.log",
                 "setupManagement.log"
             ]
-            logs_dir = path.join(cs_version.getLogDir(), "management")
-            sbs_path = path.join(self.tmpdir, "system", cs_version.getLogDir(), "management")
+            logs_dir = cs_version.getLogDir() + "/management"
+            sbs_path = path.join(self.tmpdir, "system/") + path.join(cs_version.getLogDir(), "management")
             for file in files:
                 full_path = path.join(logs_dir, file)
                 if exists(full_path):
@@ -524,8 +523,8 @@ class CloudStackLogScraper:
                     print "WARNING: file " + full_path + " does not exist"
         if mode.getMode() & mode.LOGS_CS_ALL &\
             (mode.LOGS_SYSTEM_ALL>0):
-            full_path = path.join(cs_version.getLogDir(), "management")
-            sbs_path = path.join(self.tmpdir, "system", cs_version.getLogDir(), "management")
+            full_path = cs_version.getLogDir() + "/management"
+            sbs_path = path.join(self.tmpdir, "system/") + path.join(cs_version.getLogDir(), "management")
             self.shell.cp_ar(full_path, sbs_path)
         if mode.getMode() & \
                 mode.LOGS_SYSTEM_LATEST & \
@@ -539,25 +538,28 @@ class CloudStackLogScraper:
                 "mysqld.log"
             ]
             logs_dir = "/var/log/"
-            sbs_path = path.join(self.tmpdir, "/system/var/log/")
+            sbs_path = path.join(self.tmpdir, "system/var/log/")
             for file in files:
                 full_path = path.join(logs_dir, file)
                 self.shell.cp_ar(full_path, sbs_path)
         if mode.getMode() & mode.LOGS_SYSTEM_ALL:
             full_path = "/var/log"
-            sbs_path = path.join(self.tmpdir, "/system/var/")
+            sbs_path = path.join(self.tmpdir, "system/var/")
             self.shell.cp_ar(full_path, sbs_path)
 
         try:
-            self.shell.compress_all_logs()
+            self.compress_logs()
         except IOError as io:
             raise io
 
         if exists(self.tmpdir):
             try:
-                self.shell.rm_rf()
+                self.shell.rm_rf(self.tmpdir)
             except OSError as e:
                 raise IOError("Cannot remove temporary directory %s because of %s" % (self.tmpdir, e))
+
+    def compress_logs(self):
+        self.shell.compress_all_logs(self.tmpdir)
 
     def usage(self):
         print self.__class__.__name__ + " version " + VERSION + ", utility collects information" \
@@ -648,7 +650,7 @@ def main(argv):
             mode.LOGS_CS_ALL |
             mode.LOGS_SYSTEM_LATEST |
             mode.LOGS_SYSTEM_ALL):
-        sc.sbs_logs(tmp_dir)
+        sc.sbs_logs()
 
 if __name__ == "__main__":
     from sys import argv
